@@ -22,9 +22,11 @@ A systematic orderflow strategy for BTCUSDT perpetual futures, using **Volume Pr
 
 | Notebook | Description |
 |----------|-------------|
-| `profile_orderflow_strategy.ipynb` | **Main strategy** — v10: Production rules, stale profile detection, rolling 24h fallback, 4 entry setups, setup-level risk |
-| `profile_orderflow_strategy_executed.ipynb` | Same as above with all outputs pre-executed |
-| `btcusdt_orderflow_backtest.ipynb` | First orderflow prototype (OrderBookImbalance-based, reference only) |
+| `profile_orderflow_strategy_v11.ipynb` | **Active strategy** — v11: 3 active setups, relaxed VAH_RECLAIM CVD, candidate diagnostics |
+| `profile_orderflow_strategy_v11_executed.ipynb` | Same as above with all outputs pre-executed |
+| `profile_orderflow_strategy.ipynb` | v10 reference (production rules, 4 setups) |
+| `profile_orderflow_strategy_executed.ipynb` | v10 executed reference |
+| `btcusdt_orderflow_backtest.ipynb` | First orderflow prototype (reference only) |
 | `backtest_visualization.ipynb` | EMA cross reference backtest |
 
 ---
@@ -67,22 +69,18 @@ Exhaustion (bearish):  price MAKES NEW HIGH but CVD does NOT → reversal down
 - CVD = Cumulative Delta (buy volume − sell volume per bar)
 - Lookback: 5 minute-bars for recent context
 
-### Entry Logic (v10)
+### Entry Logic (v11)
 ```
 VAH Reclaim Breakout (LONG):
-  Close ≥ prior VAH, CVD recovery confirmed, 0.5×ATR buffer, delta bullish, imbalance
+  Close ≥ prior VAH, CVD bullish OR (not falling AND not bearish), 0.5×ATR buffer
   Target: +1R (50%), +2R (30%), runner trail
 
 VAL Rejection Mean-Reversion (LONG):
-  Close in value area near VAL, CVD absorption confirmed, delta bullish, imbalance
+  Close in value area near VAL, CVD recovery confirmed, delta bullish, imbalance
   Target: prior POC
 
 VAH Rejection Mean-Reversion (SHORT):
-  Close in value area near VAH, CVD exhaustion confirmed, delta bearish, imbalance
-  Target: prior POC
-
-VAL Retest-Failure (SHORT):
-  Below VAL, retest of VAL from below, CVD failed recovery, delta bearish, imbalance
+  Close in value area near VAH, CVD bearish OR failed recovery, delta bearish, imbalance
   Target: prior POC
 ```
 
@@ -101,7 +99,7 @@ Cap: max 3× notional leverage, max 5 BTC
 - **Prior day**: single-day VAL/VAH/POC — for entry trigger levels
 - **Stale profile detection**: weekend gap (>1 day), open gap >0.4%, or gap >1× ATR
 - **Rolling 24h fallback**: when stale, fallback to last 24h of aggTrades
-- Test window: Mar 11-22 (10 days)
+- Test window: Mar 11-22 (10 days), extended to 1 month in v12
 
 ---
 
@@ -124,6 +122,58 @@ Total: 11 trades
 
 ---
 
+---
+
+## Results (v11) — Candidate Diagnostics (Mar 11–22)
+
+### Strategy Changes from v10
+- **Disabled VAL_RETEST_FAILURE_SHORT** — was 1/4 wins, −$1,067
+- **Relaxed VAH_RECLAIM_LONG CVD logic**: passes if `_cvd_bullish()` (30-bar uptrend) OR (`_cvd_not_falling()` AND not `_cvd_bearish()`)
+- **New `_cvd_not_falling()`**: checks CVD stable/rising over last 5–10 bars
+- **Fixed day 1 fallback**: pre-cached 2024-03-10 aggTrades for first test day
+- **Candidate diagnostics**: per-setup funnel tracking showing % drop-off at each filter stage
+
+### Results
+
+```
+Total: 10 trade legs (10 distinct entries)
+  Wins:  7/10 (70%)
+  Total PnL: +2.03% (+2,032 USDT)
+  Avg win: 0.18% | Avg loss: −0.18%
+  Avg lev: 1.96x | Max lev: 2.69x
+  Max single loss: −583 USDT | Max single win: +1,642 USDT
+
+VAL_REJECTION_LONG:    7 legs, +521 USDT (5/7 wins)
+VAH_REJECTION_SHORT:   3 legs, +1,511 USDT (2/3 wins)
+VAH_RECLAIM_LONG:      0 legs (still never triggered)
+```
+
+### Candidate Diagnostic Funnel
+
+```
+VAH_RECLAIM_LONG (13,918 candidates → 0 entered):
+  CVD OK:       44%  (relaxed logic helped)
+  State OK:     13%  (rarely confirmed above VAH)
+  Delta OK:      6%
+  Overextended:  0.1% ← KILLER: 98% of state-confirmed bars blocked by >VAH+ATR check
+
+VAL_REJECTION_LONG (13,915 candidates → 7 entered):
+  CVD recovery:  8%  (main signal bottleneck — intentional)
+  Setup disabled:48%  (1-entry/day + failure flag)
+
+VAH_REJECTION_SHORT (13,918 candidates → 3 entered):
+  Target dist:   8%  (POC often too close to VAH)
+  Setup disabled:25%  (failure flag blocks rest of day)
+```
+
+### Key Findings
+1. **VAH_RECLAIM_LONG overextension filter is bugged for breakouts**: `entry > active_VAH + ATR` blocks 98% of state-confirmed bars — being above VAH + ATR is expected for a breakout, not overextended
+2. **Day 1 rolling 24h fallback works** — Mar 11 now has 1 trade vs 0 in v10
+3. **VAL rejection dominates volume** — 7/10 legs, but small PnL per trade (avg +$74)
+4. **VAH rejection produces the best risk-adjusted trades** — 3 legs averaging +$504 per win
+
+---
+
 ## Future Plans
 
 ### Short-term Fixes (next iteration)
@@ -135,9 +185,11 @@ Total: 11 trades
 - [x] **Weekend gap handling**: Adjust prior-day profile relevance after weekends (v10, stale detection + rolling 24h)
 - [x] **Stronger divergence filter**: Require bar close near extreme or minimum CVD gap (v10, CVD recovery/failed-recovery/extreme)
 - [x] **VAL breakdown removal or fix**: This entry type is a consistent loser (v10, replaced with VAL retest-failure + CVD failed recovery)
-- [ ] **VAH_RECLAIM_LONG never triggers**: Conditions too restrictive — relax CVD recovery or bar confirmation
-- [ ] **VAL_RETEST_FAILURE_SHORT still losing**: 1/4 win rate, −1,067 USDT — consider removal or tighter filter
-- [ ] **Day 1 fallback**: Pre-cache previous day's aggTrades for first test day
+- [x] **VAH_RECLAIM_LONG CVD relaxed**: Added _cvd_not_falling + bearish check as alternative to _cvd_recovery (v11)
+- [x] **VAL_RETEST_FAILURE_SHORT removed**: Was 1/4 wins, −1,067 USDT (v11)
+- [x] **Day 1 fallback**: Pre-cache previous day's aggTrades for first test day (v11)
+- [ ] **Fix VAH_RECLAIM_LONG overextension**: Breakout shouldn't be blocked by "entry > VAH + ATR"
+- [ ] **Extend test window**: Validate on 1+ month of data
 
 ### Mid-term Improvements
 - [ ] **Multi-timeframe profile**: Use intraday profiles (e.g., Asian/London/NY sessions) alongside daily
@@ -274,10 +326,7 @@ Total: 20 trade legs (17 distinct entries)
 ## Reproducing the Backtest
 
 ```bash
-# Build and run the v10 notebook (production rules)
-python C:\Users\cyt\AppData\Local\Temp\opencode\build_v10.py
-jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy.ipynb --output notebooks/profile_orderflow_strategy_executed.ipynb --ExecutePreprocessor.timeout=-1
-
-# Or open interactively
-jupyter notebook notebooks/profile_orderflow_strategy.ipynb
+# Build and run the v11 notebook (active strategy)
+python C:\Users\cyt\AppData\Local\Temp\opencode\build_v11.py
+jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v11.ipynb --output notebooks/profile_orderflow_strategy_v11_executed.ipynb --ExecutePreprocessor.timeout=-1
 ```
