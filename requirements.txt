@@ -1,0 +1,12 @@
+# Core
+pandas>=2.0
+numpy
+
+# NautilusTrader (will install after setting up)
+# nautilus_trader
+
+# Data download
+requests
+
+# Analysis (optional, for tearsheets)
+# plotly>=6.3.1
