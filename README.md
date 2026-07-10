@@ -22,7 +22,7 @@ A systematic orderflow strategy for BTCUSDT perpetual futures, using **Volume Pr
 
 | Notebook | Description |
 |----------|-------------|
-| `profile_orderflow_strategy.ipynb` | **Main strategy** — v9: Value boundary entries, CVD regime filter, multi-target exits |
+| `profile_orderflow_strategy.ipynb` | **Main strategy** — v10: Production rules, stale profile detection, rolling 24h fallback, 4 entry setups, setup-level risk |
 | `profile_orderflow_strategy_executed.ipynb` | Same as above with all outputs pre-executed |
 | `btcusdt_orderflow_backtest.ipynb` | First orderflow prototype (OrderBookImbalance-based, reference only) |
 | `backtest_visualization.ipynb` | EMA cross reference backtest |
@@ -67,30 +67,41 @@ Exhaustion (bearish):  price MAKES NEW HIGH but CVD does NOT → reversal down
 - CVD = Cumulative Delta (buy volume − sell volume per bar)
 - Lookback: 5 minute-bars for recent context
 
-### Entry Logic (v8/v9)
+### Entry Logic (v10)
 ```
-Mean-reversion (VAL rejection L / VAH rejection S):
-  Entry at prior VAL/VAH + CVD regime + local divergence + delta + imbalance
+VAH Reclaim Breakout (LONG):
+  Close ≥ prior VAH, CVD recovery confirmed, 0.5×ATR buffer, delta bullish, imbalance
+  Target: +1R (50%), +2R (30%), runner trail
+
+VAL Rejection Mean-Reversion (LONG):
+  Close in value area near VAL, CVD absorption confirmed, delta bullish, imbalance
   Target: prior POC
 
-Breakout (VAH reclaim L / VAL breakdown S):
-  3-bar confirmation above VAH / below VAL + CVD regime + delta + imbalance
-  Multi-target: +1R (50%), +2R (30%), runner trail
+VAH Rejection Mean-Reversion (SHORT):
+  Close in value area near VAH, CVD exhaustion confirmed, delta bearish, imbalance
+  Target: prior POC
+
+VAL Retest-Failure (SHORT):
+  Below VAL, retest of VAL from below, CVD failed recovery, delta bearish, imbalance
+  Target: prior POC
 ```
 
 ### Dynamic Position Sizing
 ```
-Position (BTC) = Account × 2% ÷ StopDistance
-StopDistance = Entry − StopLevel
+Setup risk:  VAH_RECLAIM_LONG=1%, VAL_REJECTION_LONG=1%, VAH_REJECTION_SHORT=0.75%, VAL_RETEST_FAILURE_SHORT=0.5%
+Position (BTC) = Account × setup_risk ÷ ATR
+Cap: max 3× notional leverage, max 5 BTC
 ```
-- Stop: min(absorption bar low × 0.997, entry × 0.98) for longs
-- Stop: max(exhaustion bar high × 1.003, entry × 1.02) for shorts
-- Breakeven after 0.5% move in favor
+- Stop: entry − 1× ATR for longs, entry + 1× ATR for shorts
+- Breakeven at 0.5× ATR
+- Runner trail at 0.5× R after +2R target hit
 
 ### Profile Sources
 - **Composite**: 5 trading days (Mar 4-8) — for market context only
 - **Prior day**: single-day VAL/VAH/POC — for entry trigger levels
-- Test window: Mar 11-15 (5 consecutive days)
+- **Stale profile detection**: weekend gap (>1 day), open gap >0.4%, or gap >1× ATR
+- **Rolling 24h fallback**: when stale, fallback to last 24h of aggTrades
+- Test window: Mar 11-22 (10 days)
 
 ---
 
@@ -120,10 +131,13 @@ Total: 11 trades
 - [x] **ATR-based stops**: ATR-based stop buffers on breakout trades (v8, 0.5× ATR buffer at VAL/VAH acceptance level)
 - [x] **Trailing stop**: Runner trail at 0.5× R / 0.5× ATR on breakout trades (v8)
 - [x] **Additional data window**: Extended to 10 trading days (Mar 11-22) in v9
-- [ ] **Max position size cap**: Limit notional leverage to prevent 10+ BTC positions
-- [ ] **VAL breakdown removal or fix**: This entry type is a consistent loser
-- [ ] **Weekend gap handling**: Adjust prior-day profile relevance after weekends
-- [ ] **Stronger divergence filter**: Require bar close near extreme or minimum CVD gap
+- [x] **Max position size cap**: Limit notional leverage to prevent 10+ BTC positions (v10, 3× max, 5 BTC max)
+- [x] **Weekend gap handling**: Adjust prior-day profile relevance after weekends (v10, stale detection + rolling 24h)
+- [x] **Stronger divergence filter**: Require bar close near extreme or minimum CVD gap (v10, CVD recovery/failed-recovery/extreme)
+- [x] **VAL breakdown removal or fix**: This entry type is a consistent loser (v10, replaced with VAL retest-failure + CVD failed recovery)
+- [ ] **VAH_RECLAIM_LONG never triggers**: Conditions too restrictive — relax CVD recovery or bar confirmation
+- [ ] **VAL_RETEST_FAILURE_SHORT still losing**: 1/4 win rate, −1,067 USDT — consider removal or tighter filter
+- [ ] **Day 1 fallback**: Pre-cache previous day's aggTrades for first test day
 
 ### Mid-term Improvements
 - [ ] **Multi-timeframe profile**: Use intraday profiles (e.g., Asian/London/NY sessions) alongside daily
@@ -184,6 +198,50 @@ Total: 10 trade legs (7 distinct entries)
 
 ---
 
+## Results (v10) — Production Rules (Mar 11–22)
+
+### Strategy Changes from v9
+- **Stale profile detection** — weekend gap and open-gap checks; fallback to rolling 24h profile when stale
+- **4 entry setups** — VAH reclaim breakout (L), VAL rejection mean-reversion (L), VAH rejection mean-reversion (S), VAL retest-failure (S)
+- **VAH reclaim → LONG breakout** replaces the old VAH reclaim L entry with CVD recovery confirmation
+- **VAL retest-failure SHORT** replaces old VAL breakdown — waits for retest of VAL from below + CVD failed recovery
+- **Global filters**: min R distance (0.15%), min target distance (0.2%), overextension filter, time window (9:00–23:00 UTC), spread filter (≤25 bps), daily loss limit (2%)
+- **Setup-level risk**: 1% / 1% / 0.8% / 0.5% respectively
+- **Position caps**: max 3× notional leverage, max 5 BTC
+- **Skip logging**: every check logs a skip reason for analysis
+- **CVD recovery / failed-recovery / extreme filters** check CVD trajectory relative to price action
+
+### Results
+
+```
+Total: 12 trade legs (12 distinct entries)
+  Wins:  7/12 (58%)
+  Total PnL: +1.01% (+1,009 USDT)
+  Avg win: 0.17% | Avg loss: −0.34%
+  Avg lev: 1.81x | Max lev: 2.69x
+  Max single loss: −592 USDT | Max single win: +1,642 USDT
+
+VAL_REJECTION_LONG:    5 legs, +565 USDT (4/5 wins)
+VAH_REJECTION_SHORT:   3 legs, +1,511 USDT (2/3 wins)
+VAL_RETEST_FAILURE_SHORT: 4 legs, −1,067 USDT (1/4 wins)
+VAH_RECLAIM_LONG:      0 legs (never triggered)
+```
+
+### Key Improvements over v9
+1. **VAL_REJECTION_LONG flipped from 0/5 to 4/5 wins** — CVD filter + stale detection eliminated bad entries
+2. **Win rate 40% → 58%** — stricter filters filter out low-probability setups
+3. **Max loss reduced from −1,618 to −592 USDT** — position caps prevented 11 BTC+ sizes
+4. **Profile stale detection worked**: 3 days `stale_no_fallback`, 6 days `rolling_24h`, 1 day `prior_daily`
+5. **No extreme positioning** — avg lev 1.81x, never exceeded 3x cap
+
+### Remaining Issues
+1. **VAL_RETEST_FAILURE_SHORT**: still losing (1/4 wins, −1,067 USDT) — may need removal or tighter filter
+2. **VAH_RECLAIM_LONG**: 0 triggers in 10 days — conditions too restrictive (CVD recovery rare in uptrends)
+3. **Day 1 (Mar 11)**: 0 trades — no aggTrades cache for rolling 24h fallback on first test day
+4. **Top skip reason**: CVD_NOT_CONFIRMED (40% of 44k skips) — suggests CVD filters may be too aggressive
+
+---
+
 ## Results (v9) — Extended to 10 Test Days (Mar 11–22)
 
 ### Results
@@ -216,9 +274,9 @@ Total: 20 trade legs (17 distinct entries)
 ## Reproducing the Backtest
 
 ```bash
-# Build and run the v7 notebook
-python scripts/build_v7.py
-jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy.ipynb
+# Build and run the v10 notebook (production rules)
+python C:\Users\cyt\AppData\Local\Temp\opencode\build_v10.py
+jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy.ipynb --output notebooks/profile_orderflow_strategy_executed.ipynb --ExecutePreprocessor.timeout=-1
 
 # Or open interactively
 jupyter notebook notebooks/profile_orderflow_strategy.ipynb
