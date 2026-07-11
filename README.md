@@ -22,7 +22,9 @@ A systematic orderflow strategy for BTCUSDT perpetual futures, using **Volume Pr
 
 | Notebook | Description |
 |----------|-------------|
-| `profile_orderflow_strategy_v13.ipynb` | **Active strategy** — v13: composite bias + dynamic migration, structure stops, range rotation targets, 11-experiment matrix |
+| `profile_orderflow_strategy_v14.ipynb` | **Active strategy** — v14: 5M bars, fixed CandleBuffer + migration order, 5-state migration, VAL_REJECTION_LONG primary, 15-experiment matrix, 11 CSV exports |
+| `profile_orderflow_strategy_v14_executed.ipynb` | Same as above with all outputs pre-executed (18 test days, 15 experiments) |
+| `profile_orderflow_strategy_v13.ipynb` | v13 reference: composite bias + dynamic migration, structure stops, range rotation targets, 11-experiment matrix |
 | `profile_orderflow_strategy_v13_executed.ipynb` | Same as above with all outputs pre-executed (18 test days, 11 experiments) |
 | `profile_orderflow_strategy_v12.ipynb` | v12 reference (VAH_RECLAIM overextension fix, extended test window) |
 | `profile_orderflow_strategy_v12_executed.ipynb` | Same as above with all outputs pre-executed |
@@ -71,7 +73,7 @@ Exhaustion (bearish):  price MAKES NEW HIGH but CVD does NOT → reversal down
 - CVD = Cumulative Delta (buy volume − sell volume per bar)
 - Lookback: 5 minute-bars for recent context
 
-### Entry Logic (v13)
+### Entry Logic (v14)
 ```
 VAL Rejection Mean-Reversion (LONG):
   Active setup — composite bias NOT BEARISH, value migration NOT bearish-with-acceptance
@@ -310,11 +312,144 @@ E4    Full bias+migration       24   +1.10%  +1,104     46%  1.46x
 5. **Composite bias and migration filters have limited real-world impact** — they reject candidates but rarely affect which entries are ultimately taken. The rejection candle filter dominates.
 6. **Profile modes show minimal difference** — prior-day only (B1) underperforms at +0.56%, but all other modes produce identical results. This suggests the stale detection makes little difference in the current market regime.
 
-### What to Improve in v14
-1. **VAH_REJECTION_SHORT needs different treatment** — either wider structure stops, different exit model, or separate parameter tuning
-2. **Rejection candle criteria may be too strict** — consider relaxing close_location thresholds or adding alternative entry confirmation
-3. **Composite bias should have stronger impact** — currently only blocks BEARISH for longs and BULLISH for shorts; could be more aggressive
-4. **Structure stop validation** — the min/max distance checks may be cutting too many viable trades
+### What to Improve (v14-v15)
+1. ~~**VAH_REJECTION_SHORT needs different treatment**~~ — confirmed flat at $2, moving to diagnostics-only
+2. ~~**Rejection candle criteria may be too strict**~~ — 0.55 threshold confirmed near-optimal (E1=$3,324 vs E2/E3=$3,490)
+3. ~~**Composite bias should have stronger impact**~~ — confirmed redundant (D1=D5), abandoned
+4. ~~**Structure stop validation**~~ — 7 entries is low but max loss $473 is well-controlled
+
+---
+
+## Results (v14) — Fixed Context + 5M Bars (Mar 11–28)
+
+### Infrastructure Fixes
+1. **5M bars** — switched from 1M to 5M bars (288 bars/day vs ~1,440)
+2. **CandleBuffer bug fixed** — `get_60m_profile()` now computes profiles (was always returning None due to `_60m_cache is None` check before compute)
+3. **Migration order fixed** — `update_prev()` called after `migration_state()` (was computing slope against current=previous = 0)
+4. **Disk-based download cache** — zip files saved to temp directory, cleared after bar building (~29MB)
+5. **DayProfile prev_agg_cache** — stores 3 floats instead of 4M-row DataFrames
+6. **1970 chart timestamp fixed** — `entry_ts` now logged in trade records
+7. **5-state migration** — STRONG_BULLISH, MODERATE_BULLISH, NEUTRAL_OVERLAP, MODERATE_BEARISH, STRONG_BEARISH
+8. **11 CSV exports** — full diagnostic pipeline saved to `outputs/v14/`
+
+### Baseline (V14_A) Results
+
+```
+Total: 14 legs (14 entries)
+  Wins:  7/14 (50%)
+  Total PnL: +3.49% (+3,492 USDT)
+  Avg win: 1.40% | Avg loss: -0.25%
+  Avg win/avg loss: 2.94
+  Avg lev: 0.89x | Max lev: 1.40x
+  Max single loss: -473 USDT | Max single win: +1,410 USDT
+
+VAL_REJECTION_LONG:    9 legs, +3,490 USDT (5/9 wins, 56%)
+VAH_REJECTION_SHORT:   5 legs,      +2 USDT (2/5 wins, 40%)
+```
+
+### Profile Availability + Migration State Distribution
+
+```
+60M profile:  3,972/3,972 (100.0%) eligible bars
+180M profile: 1,927/1,927 (100.0%) eligible bars
+
+Migration states:
+  STRONG_BULLISH:     8 (0.2%)
+  MODERATE_BULLISH: 1,264 (26.5%)
+  NEUTRAL_OVERLAP:    34 (0.7%)
+  NO_CLEAR:        2,544 (53.3%)
+  MODERATE_BEARISH:  901 (18.9%)
+  STRONG_BEARISH:     18 (0.4%)
+```
+
+### Candidate Diagnostic Funnel — Baseline
+
+```
+VAL_REJECTION_LONG (4,769 candidates → 7 entered):
+  Near level:     100.0%  (all bars considered)
+  Setup enabled:   83.1%  (1 entry/day cap)
+  Profile valid:   83.1%
+  Composite OK:    62.3%  (20.8% rejected by bearish/neutral-bearish)
+  Migration OK:    62.3%  (0.1% rejected — minimal impact)
+  Rejection OK:     0.6%  (61.7% failed — MAIN bottleneck: close_location, close>=VAL, red candle)
+  Orderflow OK:     0.4%  (0.2% failed)
+  Stop OK:          0.1%  (0.2% failed — stop_too_wide)
+  Target OK:        0.1%  (0 entered failed)
+
+VAH_REJECTION_SHORT (4,769 candidates → 4 entered):
+  Near level:     100.0%
+  Setup enabled:   85.2%
+  Profile valid:   85.2%
+  Composite OK:    66.9%  (18.2% rejected)
+  Migration OK:    66.9%  (0.1% rejected)
+  Rejection OK:     1.3%  (65.6% failed — rejection candle)
+  Orderflow OK:     1.2%  (0.1% failed)
+  Stop OK:          1.1%  (0.1% failed)
+  Target OK:        0.9%  (0.2% failed by target_too_close, 0.8% by size_too_small)
+```
+
+### Experiment Comparison
+
+```
+Exp   Description                         Legs  PnL%     PnL$      Win%  AvgLv
+A     v13 baseline (fixed)                 14   +3.49%  +3,492     50%  0.89x
+A0    Fixed migration + 5M bars            14   +3.49%  +3,492     50%  0.89x
+A1    VAL_REJECTION only                    9   +3.49%  +3,490     56%  0.98x
+B1    VAH_SHORT only strict                14   +3.52%  +3,523     50%  0.89x
+C1    VAL + strict VAH                     14   +3.49%  +3,492     50%  0.89x
+D1    No composite/migration                9   +3.49%  +3,490     56%  0.98x
+D2    Composite only                        9   +3.49%  +3,490     56%  0.98x
+D3    Migration only                        9   +3.49%  +3,490     56%  0.98x
+D4    Composite + migration                 9   +3.49%  +3,490     56%  0.98x
+D5    Strict composite+migration            9   +3.49%  +3,490     56%  0.98x
+E1    Close loc >= 0.50                     9   +3.32%  +3,324     56%  0.98x
+E2    Close loc >= 0.55                     9   +3.49%  +3,490     56%  0.98x
+E3    Close loc >= 0.60                     9   +3.49%  +3,490     56%  0.98x
+F1    Entry on next candle                  9   +3.49%  +3,490     56%  0.98x
+```
+
+### MFE/MAE by Setup
+
+```
+Setup                 Legs  Avg MFE (R)  Avg MAE (R)  Max MFE (R)  Max MAE (R)
+VAL_REJECTION_LONG      9       +1.85        -0.33        +4.84        -0.84
+VAH_REJECTION_SHORT     5       +1.35        -0.57        +3.04        -1.14
+```
+
+Winners average +2.46R MFE and -0.24R MAE; losers average +0.47R MFE and -0.53R MAE. Winning trades run quickly; losing trades never develop favorable movement.
+
+### Context PnL Breakdown
+
+```
+Context                              Trades      PnL
+NEUTRAL_BULLISH | NO_CLEAR                6  +$4,214  ← all profit driver
+NEUTRAL_BULLISH | MODERATE_BEARISH        3    -$724
+NEUTRAL_BULLISH | NEUTRAL_OVERLAP         3    +$430
+NEUTRAL_BEARISH | NO_CLEAR                 2    -$428
+```
+
+No trades occur under BULLISH or BEARISH composite states — only NEUTRAL variants.
+
+### Key Findings
+
+1. **Composite/migration filters are redundant** — D1-D5 produce identical results. Filters block 0 trades that wouldn't already be filtered by rejection candle + orderflow. The 6-factor composite never reaches BULLISH or BEARISH. Recommendation: **abandon** this gating design.
+
+2. **Rejection candle is the sole edge** — 99.4% of candidates filtered here. close_location ≥ 0.55 + close ≥ VAL + red candle checks are the dominant selection mechanism. Very tight but effective.
+
+3. **VAL_REJECTION_LONG is the only viable setup** — +$3,490, 56% win rate, 0.98x avg leverage, max loss $473. VAH_REJECTION_SHORT is flat ($2, 40%) — remove from active trading.
+
+4. **Concentration risk on Mar 28** — 88% of all profit (+$3,082) from a single day. One entry at 69,152 hit POC T1 (+$713) and VAH T2 twice (+$1,360, +$1,410). Without Mar 28: net +$410 over 18 days.
+
+5. **All acceptance criteria met except outlier dependency**: PnL (+$3,492) > $1,104; win rate 50% ≥ 45%; avg win/avg loss 2.94 ≥ 1.25; max loss $473 ≤ $1,000; avg lev 0.89x < 2.0x.
+
+### Outputs
+
+All CSV diagnostics exported to `notebooks/outputs/v14/`:
+- `v14_trade_log.csv` — 146 trades across all 15 experiments
+- `v14_daily_summary.csv` — per-day PnL breakdown
+- `v14_candidate_funnel.csv` — filter pass rates per setup
+- `v14_migration_state_distribution.csv` — 5-state counts per experiment
+- `v14_vah_reclaim_diagnostic.csv` — 67K breakout/retest observations
 
 ---
 
@@ -339,8 +474,17 @@ E4    Full bias+migration       24   +1.10%  +1,104     46%  1.46x
 - [x] **Dynamic value migration**: 60M/180M rolling profiles (v13)
 - [x] **Structure-based stops**: Buyer/seller interest zone instead of fixed ATR (v13)
 - [x] **Range rotation targets**: T1 POC 40%, T2 opposite VA 40%, runner 20% (v13)
-- [ ] **Optimize VAH_REJECTION_SHORT**: Wider stops or different exit model for shorts
-- [ ] **Relax rejection candle criteria**: Current <0.1% pass rate may be too selective
+- [x] **Fix CandleBuffer profile cache**: get_60m_profile never computed profiles (v14)
+- [x] **Fix migration slope order**: update_prev was called before migration_state (v14)
+- [x] **5M bars**: reduced from 1,440 to 288 bars/day (v14)
+- [x] **5-state migration**: STRONG_BULLISH through STRONG_BEARISH (v14)
+- [x] **Disk-based download cache**: zip files on disk, cleared after build (v14)
+- [x] **11 CSV exports**: full diagnostic pipeline (v14)
+- [x] **1970 chart timestamp fixed**: entry_ts now logged (v14)
+- [ ] **Remove composite/migration filters**: confirmed redundant — D1=D5 identical
+- [ ] **VAH_REJECTION_SHORT → diagnostics-only**: flat PnL, 40% win rate
+- [ ] **Address concentration risk**: per-day position limits or volatility-based sizing
+- [ ] **Rejection candle tuning**: 0.55 threshold is near-optimal but needs robustness testing
 
 ### Mid-term Improvements
 - [ ] **Multi-timeframe profile**: Use intraday profiles (e.g., Asian/London/NY sessions) alongside daily
@@ -477,11 +621,11 @@ Total: 20 trade legs (17 distinct entries)
 ## Reproducing the Backtest
 
 ```bash
-# Build and run the v13 notebook (active strategy — 11-experiment matrix)
+# Build and run the v14 notebook (active strategy — 15-experiment matrix)
+python C:\Users\cyt\AppData\Local\Temp\opencode\build_v14.py
+jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v14.ipynb --output notebooks/profile_orderflow_strategy_v14_executed.ipynb --ExecutePreprocessor.timeout=-1
+
+# Or run the v13 reference
 python C:\Users\cyt\AppData\Local\Temp\opencode\build_v13.py
 jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v13.ipynb --output notebooks/profile_orderflow_strategy_v13_executed.ipynb --ExecutePreprocessor.timeout=-1
-
-# Or run the v12 reference
-python C:\Users\cyt\AppData\Local\Temp\opencode\build_v12.py
-jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v12.ipynb --output notebooks/profile_orderflow_strategy_v12_executed.ipynb --ExecutePreprocessor.timeout=-1
 ```
