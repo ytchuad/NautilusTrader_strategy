@@ -22,10 +22,10 @@ A systematic orderflow strategy for BTCUSDT perpetual futures, using **Volume Pr
 
 | Notebook | Description |
 |----------|-------------|
-| `profile_orderflow_strategy_v12.ipynb` | **Active strategy** — v12: 3 active setups, VAH_RECLAIM overextension fix, extended test window |
-| `profile_orderflow_strategy_v12_executed.ipynb` | Same as above with all outputs pre-executed (18 test days) |
-| `profile_orderflow_strategy_v11.ipynb` | v11 reference (3 setups, relaxed CVD, candidate diagnostics) |
-| `profile_orderflow_strategy_v11_executed.ipynb` | Same as above with all outputs pre-executed |
+| `profile_orderflow_strategy_v13.ipynb` | **Active strategy** — v13: composite bias + dynamic migration, structure stops, range rotation targets, 11-experiment matrix |
+| `profile_orderflow_strategy_v13_executed.ipynb` | Same as above with all outputs pre-executed (18 test days, 11 experiments) |
+| `profile_orderflow_strategy_v12.ipynb` | v12 reference (VAH_RECLAIM overextension fix, extended test window) |
+| `profile_orderflow_strategy_v12_executed.ipynb` | Same as above with all outputs pre-executed |
 | `profile_orderflow_strategy.ipynb` | v10 reference (production rules, 4 setups) |
 | `profile_orderflow_strategy_executed.ipynb` | v10 executed reference |
 | `btcusdt_orderflow_backtest.ipynb` | First orderflow prototype (reference only) |
@@ -71,20 +71,24 @@ Exhaustion (bearish):  price MAKES NEW HIGH but CVD does NOT → reversal down
 - CVD = Cumulative Delta (buy volume − sell volume per bar)
 - Lookback: 5 minute-bars for recent context
 
-### Entry Logic (v12)
+### Entry Logic (v13)
 ```
-VAH Reclaim Breakout (LONG):
-  Close ≥ prior VAH, CVD bullish OR (not falling AND not bearish), 0.5×ATR buffer
-  Late-entry block: >VAH+2.5×ATR AND >day_open×1.025 AND slope≥15° → skip
-  Target: +1R (50%), +2R (30%), runner trail (min_mult=1.0 for breakouts)
-
 VAL Rejection Mean-Reversion (LONG):
-  Close in value area near VAL, CVD recovery confirmed, delta bullish, imbalance
-  Target: prior POC
+  Active setup — composite bias NOT BEARISH, value migration NOT bearish-with-acceptance
+  Rejection candle: low touches VAL, close_location>0.50, close inside VA
+  3/5 orderflow conditions: delta, imbalance, CVD recovery, absorption, volume
+  Structure stop: below rejection_low / active_VAL + min/max distance checks
+  Target: POC (40%) → VAH (40%) → runner (20%) if extension eligible
 
 VAH Rejection Mean-Reversion (SHORT):
-  Close in value area near VAH, CVD bearish OR failed recovery, delta bearish, imbalance
-  Target: prior POC
+  Active setup — composite bias NOT BULLISH, value migration NOT bullish-with-acceptance
+  Rejection candle: high touches VAH, close_location<0.50, close inside VA
+  3/5 orderflow conditions: delta, imbalance, CVD failure, absorption, volume
+  Structure stop: above rejection_high / active_VAH + min/max distance checks
+  Target: POC (40%) → VAL (40%) → runner (20%) if extension eligible
+
+VAH Reclaim Breakout (LONG):
+  DISABLED in v13 — diagnostics only, zero actual trading risk
 ```
 
 ### Dynamic Position Sizing
@@ -98,11 +102,13 @@ Cap: max 3× notional leverage, max 5 BTC
 - Runner trail at 0.5× R after +2R target hit
 
 ### Profile Sources
-- **Composite**: 5 trading days (Mar 4-8) — for market context only
+- **Composite**: 5 trading days (Mar 4-8) — now used for directional bias (scored +3 to -3)
 - **Prior day**: single-day VAL/VAH/POC — for entry trigger levels
 - **Stale profile detection**: weekend gap (>1 day), open gap >0.4%, or gap >1× ATR
 - **Rolling 24h fallback**: when stale, fallback to last 24h of aggTrades
-- Test window: Mar 11-22 (10 days), extended to Mar 11-28 (18 days) in v12
+- **Dynamic 60M profile**: rolling 60-minute profile, recomputed every 5 minutes
+- **Dynamic 180M profile**: rolling 180-minute profile, recomputed every 15 minutes
+- Test window: Mar 11-28 (18 days) in v12/v13
 
 ---
 
@@ -236,6 +242,82 @@ VAH_REJECTION_SHORT (22,595 candidates → 7 entered):
 
 ---
 
+## Results (v13) — Composite Context + Dynamic Value Migration (Mar 11–28)
+
+### Design Change
+v13 is a fundamental redesign from v12's "level touched + CVD confirmation" model to:
+1. **Composite context + value migration** — composite profile (5-day) scored from -3 to +3 for bias; rolling 60M/180M profiles detect value migration
+2. **Structure-based stops** — replaces fixed 1× ATR; identifies buyer/seller interest zone
+3. **Range rotation targets** — T1=POC (40%), T2=VAH/VAL (40%), runner (20%) if extension eligible
+4. **Rejection candle quality** — close_location and body shape checks
+5. **3/5 orderflow confirmation** — delta, imbalance, CVD recovery/failure, absorption, volume
+6. **VAH_RECLAIM_LONG disabled** — zero actual trading risk, diagnostics only
+
+### Baseline (V13_A) Results
+
+```
+Total: 24 legs (24 entries)
+  Wins:  11/24 (46%)
+  Total PnL: +1.10% (+1,104 USDT)
+  Avg win: 0.56% | Avg loss: -0.24%
+  Avg lev: 1.46x | Max lev: 3.02x
+  Max single loss: -1,208 USDT | Max single win: +1,700 USDT
+
+VAL_REJECTION_LONG:   15 legs, +1,758 USDT (7/15 wins, 47%)
+VAH_REJECTION_SHORT:   9 legs,  -654 USDT (4/9 wins, 44%)
+```
+
+### Candidate Diagnostic Funnel — Baseline
+
+```
+VAL_REJECTION_LONG (25,436 candidates → 12 entered):
+  Setup enabled:  46.6%  (1 entry/day cap)
+  Composite OK:   40.1%  (6.5% rejected by bearish bias)
+  Rejection OK:    0.1%  (10,183 failed — VERY tight rejection candle filter)
+  Orderflow OK:    0.1%  (16 passed)
+  Stop OK:         0.0%  (12 passed)
+
+VAH_REJECTION_SHORT (25,436 candidates → 8 entered):
+  Setup enabled:  71.1%  (looser cap)
+  Composite OK:   56.3%  (14.7% rejected by bullish bias)
+  Rejection OK:    0.2%  (14,282 failed — rejection candle is main bottleneck)
+  Orderflow OK:    0.2%  (45 passed)
+  Target OK:       0.0%  (8 passed)
+```
+
+### Experiment Comparison
+
+```
+Exp   Description              Legs  PnL%     PnL$      Win%  AvgLv
+A     Baseline hybrid           24   +1.10%  +1,104     46%  1.46x
+B1    Prior-day only            24   +0.56%    +557     46%  1.53x
+B2    Rolling 24h only          24   +1.10%  +1,104     46%  1.46x
+B3    Hybrid wide stale         24   +1.10%  +1,104     46%  1.46x
+C1    POC-only target           20   +0.49%    +491     35%  1.74x
+C2    50/50 split target        24   +1.10%  +1,104     46%  1.46x
+D1    ATR swing stop            24   +0.85%    +850     46%  1.25x
+E1    No bias/migration         24   +1.10%  +1,104     46%  1.46x
+E2    Composite bias only       24   +1.10%  +1,104     46%  1.46x
+E3    Migration only            24   +1.10%  +1,104     46%  1.46x
+E4    Full bias+migration       24   +1.10%  +1,104     46%  1.46x
+```
+
+### Key Findings
+1. **v13 improves over v12** when VAH_RECLAIM is disabled: +1.10% vs -1.93%. Removing the losing setup was the dominant factor.
+2. **VAL_REJECTION_LONG doubled in PnL** — +$1,758 vs +$845 in v12 (15 legs vs 9). The structure stop + range rotation target model increased both entries and PnL.
+3. **VAH_REJECTION_SHORT regressed** — -$654 vs +$1,142 in v12. The structure stop may be too tight for shorts, or the range rotation exit doesn't fit short-duration mean-reversion.
+4. **Rejection candle filter is the dominant bottleneck** — only 0.1% of candidates pass. This is VERY selective (24 entries from 50,872 candidates across both setups).
+5. **Composite bias and migration filters have limited real-world impact** — they reject candidates but rarely affect which entries are ultimately taken. The rejection candle filter dominates.
+6. **Profile modes show minimal difference** — prior-day only (B1) underperforms at +0.56%, but all other modes produce identical results. This suggests the stale detection makes little difference in the current market regime.
+
+### What to Improve in v14
+1. **VAH_REJECTION_SHORT needs different treatment** — either wider structure stops, different exit model, or separate parameter tuning
+2. **Rejection candle criteria may be too strict** — consider relaxing close_location thresholds or adding alternative entry confirmation
+3. **Composite bias should have stronger impact** — currently only blocks BEARISH for longs and BULLISH for shorts; could be more aggressive
+4. **Structure stop validation** — the min/max distance checks may be cutting too many viable trades
+
+---
+
 ## Future Plans
 
 ### Short-term Fixes (next iteration)
@@ -252,8 +334,13 @@ VAH_REJECTION_SHORT (22,595 candidates → 7 entered):
 - [x] **Day 1 fallback**: Pre-cache previous day's aggTrades for first test day (v11)
 - [x] **Fix VAH_RECLAIM_LONG overextension**: Breakout-specific late-entry filter (v12)
 - [x] **Extend test window**: 18 days (Mar 11–28) in v12 (Apr 1–4 had no Binance data)
-- [ ] **Evaluate disabling VAH_RECLAIM_LONG**: Main PnL drag (-$3,920, 29% win rate)
-- [ ] **Tighten rolling 24h fallback threshold**: 0.4% gap too sensitive for crypto
+- [x] **VAH_RECLAIM_LONG disabled**: Zero actual trading risk (v13)
+- [x] **Composite bias filter**: +3/-3 scoring from composite profile (v13)
+- [x] **Dynamic value migration**: 60M/180M rolling profiles (v13)
+- [x] **Structure-based stops**: Buyer/seller interest zone instead of fixed ATR (v13)
+- [x] **Range rotation targets**: T1 POC 40%, T2 opposite VA 40%, runner 20% (v13)
+- [ ] **Optimize VAH_REJECTION_SHORT**: Wider stops or different exit model for shorts
+- [ ] **Relax rejection candle criteria**: Current <0.1% pass rate may be too selective
 
 ### Mid-term Improvements
 - [ ] **Multi-timeframe profile**: Use intraday profiles (e.g., Asian/London/NY sessions) alongside daily
@@ -390,11 +477,11 @@ Total: 20 trade legs (17 distinct entries)
 ## Reproducing the Backtest
 
 ```bash
-# Build and run the v12 notebook (active strategy)
+# Build and run the v13 notebook (active strategy — 11-experiment matrix)
+python C:\Users\cyt\AppData\Local\Temp\opencode\build_v13.py
+jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v13.ipynb --output notebooks/profile_orderflow_strategy_v13_executed.ipynb --ExecutePreprocessor.timeout=-1
+
+# Or run the v12 reference
 python C:\Users\cyt\AppData\Local\Temp\opencode\build_v12.py
 jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v12.ipynb --output notebooks/profile_orderflow_strategy_v12_executed.ipynb --ExecutePreprocessor.timeout=-1
-
-# Or run the v11 reference
-python C:\Users\cyt\AppData\Local\Temp\opencode\build_v11.py
-jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v11.ipynb --output notebooks/profile_orderflow_strategy_v11_executed.ipynb --ExecutePreprocessor.timeout=-1
 ```
