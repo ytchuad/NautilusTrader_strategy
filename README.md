@@ -22,7 +22,9 @@ A systematic orderflow strategy for BTCUSDT perpetual futures, using **Volume Pr
 
 | Notebook | Description |
 |----------|-------------|
-| `profile_orderflow_strategy_v14.ipynb` | **Active strategy** — v14: 5M bars, fixed CandleBuffer + migration order, 5-state migration, VAL_REJECTION_LONG primary, 15-experiment matrix, 11 CSV exports |
+| `profile_orderflow_strategy_v15.ipynb` | **Active strategy** — v15: research-grade rewrite, parquet data, auction context model, 3-category orderflow timing, VAL_REJECTION_LONG primary |
+| `profile_orderflow_strategy_v15_executed.ipynb` | Same as above with all outputs pre-executed (18 test days) |
+| `profile_orderflow_strategy_v14.ipynb` | v14 reference: 5M bars, fixed CandleBuffer + migration order, 5-state migration, VAL_REJECTION_LONG primary, 15-experiment matrix, 11 CSV exports |
 | `profile_orderflow_strategy_v14_executed.ipynb` | Same as above with all outputs pre-executed (18 test days, 15 experiments) |
 | `profile_orderflow_strategy_v13.ipynb` | v13 reference: composite bias + dynamic migration, structure stops, range rotation targets, 11-experiment matrix |
 | `profile_orderflow_strategy_v13_executed.ipynb` | Same as above with all outputs pre-executed (18 test days, 11 experiments) |
@@ -453,6 +455,44 @@ All CSV diagnostics exported to `notebooks/outputs/v14/`:
 
 ---
 
+## Results (v15) — Research-Grade Rewrite (Mar 11–28)
+
+### Design Changes from v14
+1. **Auction context model** — replaces v14's six-vote composite score with interpretable geometry (HIGHER_VALUE, LOWER_VALUE, OVERLAPPING_COMPOSITE, DISPLACED_VALUE) and acceptance states
+2. **3-category orderflow timing** — aggression, effectiveness, and acceptance are distinct categories (not correlated 3-of-5 votes)
+3. **Failed-auction signal** — market probes below VAL within bounded depth, signal bar closes back above VAL, at least one aggression-failure signal + one buyer-response signal
+4. **Parquet data pipeline** — aggTrades stored as parquet (was CSV), bookTicker unavailable (returns empty)
+5. **Incremental profile caching** — `AuctionContextEngine` maintains rolling merged dicts for 60M/180M profiles instead of rebuilding from scratch each bar
+6. **Profile computation fix** — `np.average` moved outside the `max()` lambda, eliminating O(n²) bottleneck (~500s → <1s per daily profile)
+
+### Results
+
+```
+Total: 7 positions
+  Net PnL: -$1,997.54
+  Win Rate: 14.3%
+  Profit Factor: 0.63
+  Median Trade: -$862.93
+  Best Trade Excluded: -$5,380.52
+```
+
+### Key Findings
+1. **v15 regressed from v14** — +3.49% → −2.0%. The redesigned signal model (failed-auction + 3-category orderflow) produces fewer, lower-quality entries.
+2. **Only 7 positions in 18 days** — the rejection-candle bottleneck tightened further. The signal bar must probe below VAL AND close back above with bounded depth AND show aggression failure AND buyer response.
+3. **Profit factor below 1.0 (0.63)** — losers are larger than winners on average. The structure-based stops and range rotation targets may need calibration for this market regime.
+4. **Low win rate (14.3%)** — even v13's worst experiment achieved 35% win rate. The multi-condition AND gate may be too restrictive, causing rare entries with poor risk/reward.
+5. **Best-trade-excluded still negative** — removing the single best trade worsens PnL from −$1,997 to −$5,380, indicating heavy reliance on one outlier.
+
+### Outputs
+
+CSV diagnostics exported to `outputs/v15/`:
+- `v15_exit_legs.csv` — per-leg trade records
+- `v15_positions.csv` — closed position summary
+- `v15_candidate_funnel.csv` — filter pass rates
+- `v15_vah_reclaim_diagnostic.csv` — breakout/retest observations
+
+---
+
 ## Future Plans
 
 ### Short-term Fixes (next iteration)
@@ -481,6 +521,12 @@ All CSV diagnostics exported to `notebooks/outputs/v14/`:
 - [x] **Disk-based download cache**: zip files on disk, cleared after build (v14)
 - [x] **11 CSV exports**: full diagnostic pipeline (v14)
 - [x] **1970 chart timestamp fixed**: entry_ts now logged (v14)
+- [x] **Parquet data pipeline**: aggTrades stored as parquet (v15)
+- [x] **Auction context model**: composite geometry, intraday profiles, material migration, acceptance (v15)
+- [x] **3-category orderflow**: aggression/effectiveness/acceptance as distinct categories (v15)
+- [x] **Failed-auction signal**: bounded probe + reclaim + shape + aggression failure + buyer response (v15)
+- [x] **Incremental profile caching**: rolling merged dicts for 60M/180M profiles (v15)
+- [x] **Profile computation fix**: np.average moved outside max() lambda, O(n²) → O(n) (v15)
 - [ ] **Remove composite/migration filters**: confirmed redundant — D1=D5 identical
 - [ ] **VAH_REJECTION_SHORT → diagnostics-only**: flat PnL, 40% win rate
 - [ ] **Address concentration risk**: per-day position limits or volatility-based sizing
@@ -621,11 +667,13 @@ Total: 20 trade legs (17 distinct entries)
 ## Reproducing the Backtest
 
 ```bash
-# Build and run the v14 notebook (active strategy — 15-experiment matrix)
-python C:\Users\cyt\AppData\Local\Temp\opencode\build_v14.py
-jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v14.ipynb --output notebooks/profile_orderflow_strategy_v14_executed.ipynb --ExecutePreprocessor.timeout=-1
+# Run the v15 notebook (active strategy)
+jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v15.ipynb --output notebooks/profile_orderflow_strategy_v15_executed.ipynb --ExecutePreprocessor.timeout=-1
 
-# Or run the v13 reference
-python C:\Users\cyt\AppData\Local\Temp\opencode\build_v13.py
-jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v13.ipynb --output notebooks/profile_orderflow_strategy_v13_executed.ipynb --ExecutePreprocessor.timeout=-1
+# Or via CLI with nbconvert + python
+jupyter nbconvert --to script notebooks/profile_orderflow_strategy_v15.ipynb --output v15_run
+python notebooks/v15_run.py
+
+# Run the v14 reference (15-experiment matrix)
+jupyter nbconvert --to notebook --execute notebooks/profile_orderflow_strategy_v14.ipynb --output notebooks/profile_orderflow_strategy_v14_executed.ipynb --ExecutePreprocessor.timeout=-1
 ```
