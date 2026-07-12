@@ -2,11 +2,7 @@
 data/
 downloads/
 
-# Backtest outputs
-outputs/
 
-# Executed notebooks (output artifacts)
-*_executed.ipynb
 
 # Python
 __pycache__/
