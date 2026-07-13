@@ -465,31 +465,87 @@ All CSV diagnostics exported to `notebooks/outputs/v14/`:
 5. **Incremental profile caching** — `AuctionContextEngine` maintains rolling merged dicts for 60M/180M profiles instead of rebuilding from scratch each bar
 6. **Profile computation fix** — `np.average` moved outside the `max()` lambda, eliminating O(n²) bottleneck (~500s → <1s per daily profile)
 
-### Results
+### Results (corrected: is_buyer_maker data corruption fixed)
+
+After regenerating the parquet with the correct `is_buyer_maker` (it was all-True due to a
+str→bool corruption), the v15 backtest produces **0 positions / 0 trades** over the 18 test
+days (Mar 11–28). The earlier "7 positions, −$1,997" was an artifact of that bad data
+(fixed in commit `d279687`).
+
+Why 0 trades: the VAL_REJECTION_LONG signal requires all 8 gates True on a single 5-minute
+bar (an AND chain). The candidate funnel shows the chain collapses before any bar qualifies:
 
 ```
-Total: 7 positions
-  Net PnL: -$1,997.54
-  Win Rate: 14.3%
-  Profit Factor: 0.63
-  Median Trade: -$862.93
-  Best Trade Excluded: -$5,380.52
+VAL_REJECTION_LONG funnel (5,184 candidate bars over 18 days):
+  bounded_probe:        225  (4.3%)   ← strictest first gate
+  + reclaim:             70  (1.3%)
+  all 8 gates pass:       0  (0.0%)   ← 0 qualifying signals
+  near-miss (7/8 gates):  29
 ```
+
+So there is nothing to trade — the bottleneck is the gate AND-chain, not one bad parameter.
+Per review we did NOT immediately loosen thresholds (that overfits). Instead we ran a
+**candidate outcome study** (below) to decide where the edge — if any — actually lives.
+
+### Candidate Outcome Study (VAL_REJECTION_LONG)
+
+For every one of the 225 `bounded_probe` candidates we look forward 1 / 3 / 6 / 12 / 24
+five-minute bars (5 / 15 / 30 / 60 / 120 min) and measure, in R units (R = per-trade risk):
+forward return, MFE, MAE, MFE:MAE ratio, whether price reaches POC before the structural
+stop, and POC/stop distances. Candidates are bucketed into 8 progressively-stricter
+cumulative-gate groups (G1 = bounded_probe only … G7 = all 7 meaningful gates; G8 = near-miss
+passing 7/8 gates). Entry reference = signal-bar close. Source cell: `v15cstudy` in the
+executed notebook.
+
+```
+Group                     n   h24_mean_fwd(R)   h24_win   h24_MFE   h24_MAE   h24_pct_poc_first   h24_pct_stop_first
+G1 bounded_probe        155          -0.016     0.542     6.828     8.377            0.077               0.723
+G2 +reclaim              40          -0.376     0.600     2.749     4.037            0.100               0.650
+G3 +shape                 9          +0.858     0.778     2.461     2.404            0.333               0.444
+G4 +no_lower_acc         16          +0.085     0.562     1.729     2.293            0.062               0.562
+G5 +aggression_fail       4          +1.192     0.750     2.181     1.107            0.250               0.250
+G6 +buyer_response        1          +1.080     1.000     3.920     0.173            0.000               0.000
+G8 near-miss (7/8)       12          +0.194     0.667     2.195     1.999            0.250               0.333
+```
+
+Interpretation (answers the 5 review questions):
+1. **Is bounded_probe too narrow?** No. G1 has 155 samples but a flat/negative mean return
+   (-0.016R, 54% win). The first gate already filters 96% of bars yet its survivors show no
+   clear edge — so the probe is not the problem.
+2. **Does Shape add edge?** G2→G3 win rate 60%→78%, but G3 has only 9 samples — tentative.
+3. **Does Aggression_Failure add incremental value?** G4→G5 h24 return 0.085R→1.192R, but
+   G5 has only 4 samples.
+4. **Does Buyer_Response over-delay / weaken?** G5→G6 win 75%→100%, but G6 has only 1 sample.
+5. **Participation: quality or missed low-volume exhaustion?** Near-miss (7/8) win 67% (n=12);
+   fully-qualifying (all 7 gates) = 0 bars.
+
+**Conclusion:** the 0-trade result is caused by the ALL-8-AND gate, not by any single gate.
+The stricter groups are far too small (G3–G6 ≤ 16) to read edge reliably. Before changing
+thresholds, enlarge the sample (more days / multiple regimes) so the stricter groups have
+enough observations. Full per-candidate detail: `v15_candidate_outcome_study.csv`;
+group summary: `v15_candidate_outcome_summary.csv`.
 
 ### Key Findings
-1. **v15 regressed from v14** — +3.49% → −2.0%. The redesigned signal model (failed-auction + 3-category orderflow) produces fewer, lower-quality entries.
-2. **Only 7 positions in 18 days** — the rejection-candle bottleneck tightened further. The signal bar must probe below VAL AND close back above with bounded depth AND show aggression failure AND buyer response.
-3. **Profit factor below 1.0 (0.63)** — losers are larger than winners on average. The structure-based stops and range rotation targets may need calibration for this market regime.
-4. **Low win rate (14.3%)** — even v13's worst experiment achieved 35% win rate. The multi-condition AND gate may be too restrictive, causing rare entries with poor risk/reward.
-5. **Best-trade-excluded still negative** — removing the single best trade worsens PnL from −$1,997 to −$5,380, indicating heavy reliance on one outlier.
+1. **0 trades, corrected data** — prior "7 positions / −$1,997" was an artifact of the
+   `is_buyer_maker` str→bool corruption (now fixed: 0 positions).
+2. **Gate AND-chain is the bottleneck** — 225 pass the first gate, 70 pass the second, 0 pass
+   all 8. The signal model is over-constrained, not under-edged.
+3. **bounded_probe survivors are flat** — G1 mean h24 return −0.016R; the probe filter does
+   not by itself isolate profitable setups.
+4. **Edge (if any) is in the later gates** — G3–G6 show higher win/return, but samples are
+   tiny (≤ 16). This is the direction to investigate, not a result to act on yet.
+5. **Next step is more data, not looser thresholds** — the study cannot rank gate value on
+   18 days; expand the window before tuning.
 
 ### Outputs
 
 CSV diagnostics exported to `outputs/v15/`:
-- `v15_exit_legs.csv` — per-leg trade records
-- `v15_positions.csv` — closed position summary
-- `v15_candidate_funnel.csv` — filter pass rates
-- `v15_vah_reclaim_diagnostic.csv` — breakout/retest observations
+- `v15_exit_legs.csv` — per-leg trade records (empty: 0 trades)
+- `v15_positions.csv` — closed position summary (empty: 0 trades)
+- `v15_candidate_funnel.csv` — filter pass rates per gate (5,184 candidate bars)
+- `v15_vah_reclaim_diagnostic.csv` — VAH reclaim breakout/retest observations
+- `v15_candidate_outcome_study.csv` — per-candidate forward MFE/MAE / first-touch study (225 rows)
+- `v15_candidate_outcome_summary.csv` — 8-group summary of the outcome study
 
 ---
 
@@ -527,6 +583,7 @@ CSV diagnostics exported to `outputs/v15/`:
 - [x] **Failed-auction signal**: bounded probe + reclaim + shape + aggression failure + buyer response (v15)
 - [x] **Incremental profile caching**: rolling merged dicts for 60M/180M profiles (v15)
 - [x] **Profile computation fix**: np.average moved outside max() lambda, O(n²) → O(n) (v15)
+- [x] **Candidate outcome study**: 225 bounded_probe candidates, forward MFE/MAE / first-touch by 8 gate groups (v15, cell `v15cstudy`)
 - [ ] **Remove composite/migration filters**: confirmed redundant — D1=D5 identical
 - [ ] **VAH_REJECTION_SHORT → diagnostics-only**: flat PnL, 40% win rate
 - [ ] **Address concentration risk**: per-day position limits or volatility-based sizing
